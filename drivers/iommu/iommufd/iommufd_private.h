@@ -21,7 +21,6 @@ struct iommufd_ctx {
 	struct file *file;
 	struct xarray objects;
 	struct xarray groups;
-	wait_queue_head_t destroy_wait;
 
 	u8 account_mode;
 	/* Compatibility with VFIO no iommu */
@@ -136,7 +135,7 @@ enum iommufd_object_type {
 
 /* Base struct for all objects with a userspace ID handle. */
 struct iommufd_object {
-	refcount_t shortterm_users;
+	struct rw_semaphore destroy_rwsem;
 	refcount_t users;
 	enum iommufd_object_type type;
 	unsigned int id;
@@ -144,15 +143,10 @@ struct iommufd_object {
 
 static inline bool iommufd_lock_obj(struct iommufd_object *obj)
 {
-	if (!refcount_inc_not_zero(&obj->users))
+	if (!down_read_trylock(&obj->destroy_rwsem))
 		return false;
-	if (!refcount_inc_not_zero(&obj->shortterm_users)) {
-		/*
-		 * If the caller doesn't already have a ref on obj this must be
-		 * called under the xa_lock. Otherwise the caller is holding a
-		 * ref on users. Thus it cannot be one before this decrement.
-		 */
-		refcount_dec(&obj->users);
+	if (!refcount_inc_not_zero(&obj->users)) {
+		up_read(&obj->destroy_rwsem);
 		return false;
 	}
 	return true;
@@ -160,16 +154,10 @@ static inline bool iommufd_lock_obj(struct iommufd_object *obj)
 
 struct iommufd_object *iommufd_get_object(struct iommufd_ctx *ictx, u32 id,
 					  enum iommufd_object_type type);
-static inline void iommufd_put_object(struct iommufd_ctx *ictx,
-				      struct iommufd_object *obj)
+static inline void iommufd_put_object(struct iommufd_object *obj)
 {
-	/*
-	 * Users first, then shortterm so that REMOVE_WAIT_SHORTTERM never sees
-	 * a spurious !0 users with a 0 shortterm_users.
-	 */
 	refcount_dec(&obj->users);
-	if (refcount_dec_and_test(&obj->shortterm_users))
-		wake_up_interruptible_all(&ictx->destroy_wait);
+	up_read(&obj->destroy_rwsem);
 }
 
 void iommufd_object_abort(struct iommufd_ctx *ictx, struct iommufd_object *obj);
@@ -177,49 +165,17 @@ void iommufd_object_abort_and_destroy(struct iommufd_ctx *ictx,
 				      struct iommufd_object *obj);
 void iommufd_object_finalize(struct iommufd_ctx *ictx,
 			     struct iommufd_object *obj);
-
-enum {
-	REMOVE_WAIT_SHORTTERM = 1,
-};
-int iommufd_object_remove(struct iommufd_ctx *ictx,
-			  struct iommufd_object *to_destroy, u32 id,
-			  unsigned int flags);
-
-/*
- * The caller holds a users refcount and wants to destroy the object. At this
- * point the caller has no shortterm_users reference and at least the xarray
- * will be holding one.
- */
+void __iommufd_object_destroy_user(struct iommufd_ctx *ictx,
+				   struct iommufd_object *obj, bool allow_fail);
 static inline void iommufd_object_destroy_user(struct iommufd_ctx *ictx,
 					       struct iommufd_object *obj)
 {
-	int ret;
-
-	ret = iommufd_object_remove(ictx, obj, obj->id, REMOVE_WAIT_SHORTTERM);
-
-	/*
-	 * If there is a bug and we couldn't destroy the object then we did put
-	 * back the caller's users refcount and will eventually try to free it
-	 * again during close.
-	 */
-	WARN_ON(ret);
+	__iommufd_object_destroy_user(ictx, obj, false);
 }
-
-/*
- * The HWPT allocated by autodomains is used in possibly many devices and
- * is automatically destroyed when its refcount reaches zero.
- *
- * If userspace uses the HWPT manually, even for a short term, then it will
- * disrupt this refcounting and the auto-free in the kernel will not work.
- * Userspace that tries to use the automatically allocated HWPT must be careful
- * to ensure that it is consistently destroyed, eg by not racing accesses
- * and by not attaching an automatic HWPT to a device manually.
- */
-static inline void
-iommufd_object_put_and_try_destroy(struct iommufd_ctx *ictx,
-				   struct iommufd_object *obj)
+static inline void iommufd_object_deref_user(struct iommufd_ctx *ictx,
+					     struct iommufd_object *obj)
 {
-	iommufd_object_remove(ictx, obj, obj->id, 0);
+	__iommufd_object_destroy_user(ictx, obj, true);
 }
 
 struct iommufd_object *_iommufd_object_alloc(struct iommufd_ctx *ictx,
@@ -355,7 +311,7 @@ static inline void iommufd_hw_pagetable_put(struct iommufd_ctx *ictx,
 		lockdep_assert_not_held(&hwpt_paging->ioas->mutex);
 
 		if (hwpt_paging->auto_domain) {
-			iommufd_object_put_and_try_destroy(ictx, &hwpt->obj);
+			iommufd_object_deref_user(ictx, &hwpt->obj);
 			return;
 		}
 	}

@@ -293,13 +293,15 @@ static int _test_mock_dirty_bitmaps(int fd, __u32 hwpt_id, size_t length,
 				    __u64 bitmap_size, __u32 flags,
 				    struct __test_metadata *_metadata)
 {
-	unsigned long i, nbits = bitmap_size * BITS_PER_BYTE;
+	unsigned long i, count, nbits = bitmap_size * BITS_PER_BYTE;
 	unsigned long nr = nbits / 2;
 	__u64 out_dirty = 0;
 
 	/* Mark all even bits as dirty in the mock domain */
-	for (i = 0; i < nbits; i += 2)
-		set_bit(i, (unsigned long *)bitmap);
+	for (count = 0, i = 0; i < nbits; count += !(i % 2), i++)
+		if (!(i % 2))
+			set_bit(i, (unsigned long *)bitmap);
+	ASSERT_EQ(nr, count);
 
 	test_cmd_mock_domain_set_dirty(fd, hwpt_id, length, iova, page_size,
 				       bitmap, &out_dirty);
@@ -309,10 +311,9 @@ static int _test_mock_dirty_bitmaps(int fd, __u32 hwpt_id, size_t length,
 	memset(bitmap, 0, bitmap_size);
 	test_cmd_get_dirty_bitmap(fd, hwpt_id, length, iova, page_size, bitmap,
 				  flags);
-	/* Beware ASSERT_EQ() is two statements -- braces are not redundant! */
-	for (i = 0; i < nbits; i++) {
+	for (count = 0, i = 0; i < nbits; count += !(i % 2), i++)
 		ASSERT_EQ(!(i % 2), test_bit(i, (unsigned long *)bitmap));
-	}
+	ASSERT_EQ(count, out_dirty);
 
 	memset(bitmap, 0, bitmap_size);
 	test_cmd_get_dirty_bitmap(fd, hwpt_id, length, iova, page_size, bitmap,
